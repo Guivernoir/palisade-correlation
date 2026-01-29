@@ -1,0 +1,51 @@
+[package]
+name = "palisade-correlation"
+version = "0.1.0"
+edition = "2021"
+authors = ["Palisade Contributors"]
+description = "Attack correlation engine for the Palisade honeypot system"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Guivernoir/palisade-correlation"
+keywords = ["security", "honeypot", "intrusion-detection", "correlation", "attack-detection"]
+categories = ["network-programming", "security"]
+
+[dependencies]
+# Published Palisade crates
+palisade_errors = "0.2.2"
+palisade-config = "0.1"
+
+# Core dependencies
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Cryptographic primitives
+sha3 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+
+# Data structures
+dashmap = "6"
+parking_lot = "0.12"
+
+# Encoding
+hex = "0.4"
+
+# Optional features
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"
+criterion = "0.5"
+
+[features]
+default = []
+tracing = ["dep:tracing", "dep:tracing-subscriber"]
+# Enable all features for testing
+full = ["tracing"]
+
+[lib]
+name = "palisade_correlation"
+path = "src/lib.rs"
