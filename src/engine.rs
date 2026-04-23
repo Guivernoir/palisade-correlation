@@ -1,525 +1,447 @@
-//! Core correlation engine for attack detection.
-//!
-//! This engine processes security events, correlates them into campaigns,
-//! calculates threat scores, and determines appropriate responses.
+//! Fixed-capacity internal engine for the public correlation API.
 
-use crate::events::{EventId, EventSeverity, SecurityEvent};
-use crate::patterns::{AttackCampaign, AttackPattern, KillChainStage, PatternDetector};
-use dashmap::DashMap;
-use parking_lot::RwLock;
-use palisade_config::{ActionType, PolicyConfig, ResponseCondition, Severity};
-use palisade_errors::{definitions, AgentError, Result};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use chrono::Timelike;
+use crate::events::EventContext;
+use crate::failures::{context_error, invalid_score_error};
+use crate::matching::copy_str_to_buffer;
+use crate::patterns::{
+    MAX_PATTERNS_PER_RESULT, detect_patterns, infer_kill_chain_stage, push_unique_campaign_pattern,
+};
+use crate::policy::{
+    RuntimeCorrelationPolicy, calculate_base_score, determine_action, severity_from_score,
+};
+use crate::runtime::{CorrelationState, SourceState};
+use crate::timing::now_secs;
+use heapless::Vec as HVec;
+use palisade_config::PolicyConfig;
+use palisade_errors::AgentError;
+use std::fmt::Write as _;
+use std::net::IpAddr;
 
-/// Correlation engine state
-pub struct CorrelationEngine {
-    /// Policy configuration
-    policy: Arc<RwLock<PolicyConfig>>,
-    
-    /// Pattern detector
-    pattern_detector: Arc<RwLock<PatternDetector>>,
-    
-    /// Active campaigns by source IP
-    campaigns: Arc<DashMap<String, AttackCampaign>>,
-    
-    /// Event counter for generating IDs
-    event_counter: Arc<AtomicU64>,
-    
-    /// Incident counter
-    incident_counter: Arc<AtomicU64>,
-    
-    /// Last response time by campaign ID (for cooldown)
-    last_response_time: Arc<DashMap<String, u64>>,
-}
+pub(crate) use crate::runtime::{
+    ACTION_ALERT, ACTION_CUSTOM_SCRIPT, ACTION_ISOLATE_HOST, ACTION_KILL_PROCESS, ACTION_LOG,
+    MAX_ACTION_PATH_LEN, MAX_HISTORY_DEPTH, MAX_IP_TEXT_LEN, MAX_TRACKED_SOURCES,
+    SEVERITY_CRITICAL, SEVERITY_HIGH, SEVERITY_INFORMATIONAL, SEVERITY_LOW, SEVERITY_MEDIUM,
+};
 
-/// Correlation result
-#[derive(Debug, Clone)]
-pub struct CorrelationResult {
-    /// Calculated threat score
-    pub score: f64,
-    
-    /// Event severity
-    pub severity: EventSeverity,
-    
-    /// Detected attack patterns
-    pub patterns: Vec<AttackPattern>,
-    
-    /// Campaign ID (if part of ongoing campaign)
-    pub campaign_id: Option<String>,
-    
-    /// Recommended action
-    pub action: ActionType,
-    
-    /// Whether response is on cooldown
-    pub on_cooldown: bool,
-    
-    /// Kill chain stage (if determinable)
-    pub kill_chain_stage: Option<KillChainStage>,
-}
-
-/// Incident details
-#[derive(Debug, Clone)]
-pub struct Incident {
-    /// Incident ID
-    pub id: u64,
-    
-    /// Associated events
-    pub events: Vec<EventId>,
-    
-    /// Source IP
-    pub source_ip: String,
-    
-    /// Incident score
-    pub score: f64,
-    
-    /// Severity
-    pub severity: EventSeverity,
-    
-    /// Detected patterns
-    pub patterns: Vec<AttackPattern>,
-    
-    /// Timestamp
-    pub timestamp: u64,
-    
-    /// Recommended action
-    pub action: ActionType,
+pub(crate) struct CorrelationEngine {
+    policy: RuntimeCorrelationPolicy,
+    state: CorrelationState,
 }
 
 impl CorrelationEngine {
-    /// Create a new correlation engine
-    pub fn new(policy: PolicyConfig) -> Self {
-        let max_events = policy.scoring.max_events_in_memory;
-        
-        Self {
-            policy: Arc::new(RwLock::new(policy)),
-            pattern_detector: Arc::new(RwLock::new(PatternDetector::new(max_events))),
-            campaigns: Arc::new(DashMap::new()),
-            event_counter: Arc::new(AtomicU64::new(0)),
-            incident_counter: Arc::new(AtomicU64::new(0)),
-            last_response_time: Arc::new(DashMap::new()),
-        }
-    }
-    
-    /// Process a security event and correlate it
-    pub fn correlate(&self, mut event: SecurityEvent) -> Result<CorrelationResult> {
-        // Assign event ID if not set
-        if event.id == 0 {
-            event.id = self.event_counter.fetch_add(1, Ordering::SeqCst);
-        }
-        
-        let policy = self.policy.read();
-        let source_ip = event.source_ip.to_string();
-        
-        // Calculate base score
-        let mut score = self.calculate_event_score(&event, &policy);
-        
-        // Detect patterns
-        let patterns = {
-            let mut detector = self.pattern_detector.write();
-            detector.analyze(&event)
-        };
-        
-        // Update or create campaign
-        let campaign_id = self.update_campaign(&source_ip, &event, &patterns, score);
-        
-        // Apply correlation bonus if part of campaign
-        if let Some(ref cid) = campaign_id {
-            if let Some(campaign) = self.campaigns.get(cid) {
-                // Boost score based on campaign history
-                let correlation_boost = (campaign.event_count as f64 * 2.0).min(20.0);
-                score += correlation_boost;
-            }
-        }
-        
-        // Determine severity
-        let severity = EventSeverity::from_score(score);
-        
-        // Determine action
-        let action = self.determine_action(score, severity, &event, &policy)?;
-        
-        // Check cooldown
-        let on_cooldown = self.is_on_cooldown(&campaign_id, &policy);
-        
-        // Infer kill chain stage
-        let kill_chain_stage = PatternDetector::infer_kill_chain_stage(&patterns);
-        
-        Ok(CorrelationResult {
-            score,
-            severity,
-            patterns,
-            campaign_id,
-            action,
-            on_cooldown,
-            kill_chain_stage,
+    pub(crate) fn from_policy(policy: &PolicyConfig) -> Result<Self, AgentError> {
+        Ok(Self {
+            policy: RuntimeCorrelationPolicy::from_policy(policy)?,
+            state: CorrelationState::new(),
         })
     }
-    
-    /// Calculate score for a single event
-    fn calculate_event_score(&self, event: &SecurityEvent, policy: &PolicyConfig) -> f64 {
-        use crate::events::EventType;
-        
-        let weights = &policy.scoring.weights;
-        let mut score = 0.0;
-        
-        // Base score from event type
-        match &event.event_type {
-            EventType::ArtifactAccess { .. } => {
-                score += weights.artifact_access;
-            }
-            EventType::SuspiciousProcess { .. } => {
-                score += weights.suspicious_process;
-            }
-            EventType::RapidEnumeration { .. } => {
-                score += weights.rapid_enumeration;
-            }
-            EventType::OffHoursActivity { .. } => {
-                if policy.scoring.enable_time_scoring {
-                    score += weights.off_hours_activity;
-                }
-            }
-            EventType::SuspiciousAncestry { .. } => {
-                if policy.scoring.enable_ancestry_tracking {
-                    score += weights.ancestry_suspicious;
-                }
-            }
-            EventType::AuthenticationFailure { .. } => {
-                score += 15.0;
-            }
-            EventType::PathTraversal { .. } => {
-                score += 25.0;
-            }
-            EventType::SqlInjection { .. } => {
-                score += 30.0;
-            }
-            EventType::CommandInjection { .. } => {
-                score += 35.0;
-            }
-            EventType::ConfigurationChange { .. } => {
-                score += 10.0;
-            }
-            EventType::ErrorEvent { .. } => {
-                score += 5.0;
-            }
-        }
-        
-        // Apply confidence modifier
-        score *= event.confidence / 100.0;
-        
-        score
-    }
-    
-    /// Update or create attack campaign
-    fn update_campaign(
-        &self,
-        source_ip: &str,
-        event: &SecurityEvent,
-        patterns: &[AttackPattern],
-        _score: f64,
-    ) -> Option<String> {
-        let campaign_id = format!("campaign-{}", source_ip);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        
-        self.campaigns
-            .entry(campaign_id.clone())
-            .and_modify(|campaign| {
-                campaign.last_activity = now;
-                campaign.event_count += 1;
-                
-                // Merge patterns (avoid duplicates)
-                for pattern in patterns {
-                    if !campaign.patterns.contains(pattern) {
-                        campaign.patterns.push(pattern.clone());
-                    }
-                }
-                
-                // Update confidence (running average)
-                campaign.confidence = 
-                    (campaign.confidence * 0.8) + (event.confidence * 0.2);
-                
-                // Update kill chain stage
-                campaign.kill_chain_stage = 
-                    PatternDetector::infer_kill_chain_stage(&campaign.patterns);
-            })
-            .or_insert_with(|| AttackCampaign {
-                id: campaign_id.clone(),
-                source_ip: source_ip.to_string(),
-                start_time: now,
-                last_activity: now,
-                patterns: patterns.to_vec(),
-                event_count: 1,
-                confidence: event.confidence,
-                kill_chain_stage: PatternDetector::infer_kill_chain_stage(patterns),
-            });
-        
-        Some(campaign_id)
-    }
-    
-    /// Determine appropriate action based on score and policy
-    fn determine_action(
-        &self,
-        _score: f64,
-        severity: EventSeverity,
-        event: &SecurityEvent,
-        policy: &PolicyConfig,
-    ) -> Result<ActionType> {
-        // Convert our EventSeverity to palisade_config::Severity
-        let policy_severity = match severity {
-            EventSeverity::Low => Severity::Low,
-            EventSeverity::Medium => Severity::Medium,
-            EventSeverity::High => Severity::High,
-            EventSeverity::Critical => Severity::Critical,
-        };
-        
-        // Find matching response rule
-        for rule in &policy.response.rules {
-            if rule.severity != policy_severity {
-                continue;
-            }
-            
-            // Check all conditions
-            let mut conditions_met = true;
-            
-            for condition in &rule.conditions {
-                match condition {
-                    ResponseCondition::MinConfidence { threshold } => {
-                        if event.confidence < *threshold {
-                            conditions_met = false;
-                            break;
-                        }
-                    }
-                    ResponseCondition::TimeWindow { start_hour, end_hour } => {
-                        let current_hour = chrono::Utc::now().hour() as u8;
-                        if current_hour < *start_hour || current_hour >= *end_hour {
-                            conditions_met = false;
-                            break;
-                        }
-                    }
-                    ResponseCondition::NotParentedBy { .. } => {
-                        // Process ancestry checking not implemented - skip condition
-                        // In production, would check if event's process is NOT parented by specified process
-                    }
-                    ResponseCondition::MinSignalTypes { count } => {
-                        // Check if minimum number of different signal types seen
-                        // For now, assume condition is met (requires campaign context)
-                        if *count > 1 {
-                            // This would require checking campaign history for signal type diversity
-                            // Simplified implementation - always pass for now
-                        }
-                    }
-                    ResponseCondition::RepeatCount { count, .. } => {
-                        // Check if event has repeated N times within window
-                        // For now, assume condition is met (requires campaign context)
-                        if *count > 1 {
-                            // This would require checking campaign history for repeat events
-                            // Simplified implementation - always pass for now
-                        }
-                    }
-                    ResponseCondition::Custom { name, .. } => {
-                        // Custom conditions would be evaluated by external handler
-                        // For now, we validate that they're registered
-                        if !policy.registered_custom_conditions.contains(name) {
-                            return Err(AgentError::response(
-                                definitions::RSP_EXEC_FAILED,
-                                "determine_action",
-                                format!("Unregistered custom condition: {}", name)
-                            ));
-                        }
-                    }
-                }
-            }
-            
-            if conditions_met {
-                return Ok(rule.action.clone());
-            }
-        }
-        
-        // Default action if no rule matches
-        Ok(ActionType::Log)
-    }
-    
-    /// Check if response is on cooldown
-    fn is_on_cooldown(&self, campaign_id: &Option<String>, policy: &PolicyConfig) -> bool {
-        if let Some(cid) = campaign_id {
-            if let Some(last_response) = self.last_response_time.get(cid) {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                
-                let elapsed = now - *last_response;
-                return elapsed < policy.response.cooldown_secs;
-            }
-        }
-        
-        false
-    }
-    
-    /// Record response action
-    pub fn record_response(&self, campaign_id: &str) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        
-        self.last_response_time.insert(campaign_id.to_string(), now);
-    }
-    
-    /// Get active campaigns
-    pub fn get_active_campaigns(&self) -> Vec<AttackCampaign> {
-        self.campaigns
-            .iter()
-            .map(|entry| entry.value().clone())
-            .collect()
-    }
-    
-    /// Get campaign by ID
-    pub fn get_campaign(&self, campaign_id: &str) -> Option<AttackCampaign> {
-        self.campaigns.get(campaign_id).map(|c| c.clone())
-    }
-    
-    /// Prune stale campaigns (inactive for X seconds)
-    pub fn prune_stale_campaigns(&self, max_age_secs: u64) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        
-        self.campaigns.retain(|_, campaign| {
-            (now - campaign.last_activity) < max_age_secs
-        });
-    }
-    
-    /// Hot-reload policy
-    pub fn reload_policy(&self, new_policy: PolicyConfig) -> Result<()> {
-        // Validate new policy
-        new_policy.validate()?;
-        
-        // Apply new policy
-        let mut policy = self.policy.write();
-        *policy = new_policy;
-        
+
+    pub(crate) fn reload_policy(&mut self, policy: &PolicyConfig) -> Result<(), AgentError> {
+        self.policy = RuntimeCorrelationPolicy::from_policy(policy)?;
         Ok(())
     }
-    
-    /// Get current policy (for inspection)
-    pub fn get_policy(&self) -> PolicyConfig {
-        self.policy.read().clone()
-    }
-    
-    /// Create incident from correlation result
-    pub fn create_incident(
-        &self,
-        event_ids: Vec<EventId>,
-        source_ip: String,
-        result: &CorrelationResult,
-    ) -> Incident {
-        let incident_id = self.incident_counter.fetch_add(1, Ordering::SeqCst);
-        
-        Incident {
-            id: incident_id,
-            events: event_ids,
-            source_ip,
-            score: result.score,
-            severity: result.severity,
-            patterns: result.patterns.clone(),
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            action: result.action.clone(),
-        }
-    }
-    
-    /// Get statistics
-    pub fn get_stats(&self) -> EngineStats {
-        EngineStats {
-            total_events_processed: self.event_counter.load(Ordering::SeqCst),
-            total_incidents: self.incident_counter.load(Ordering::SeqCst),
-            active_campaigns: self.campaigns.len(),
-            tracked_ips: {
-                let detector = self.pattern_detector.read();
-                detector.tracked_ip_count()
-            },
-        }
-    }
-}
 
-/// Engine statistics
-#[derive(Debug, Clone)]
-pub struct EngineStats {
-    pub total_events_processed: u64,
-    pub total_incidents: u64,
-    pub active_campaigns: usize,
-    pub tracked_ips: usize,
+    pub(crate) fn is_suspicious_process(&self, process_name: &str) -> bool {
+        self.policy.is_suspicious_process(process_name)
+    }
+
+    pub(crate) fn process(&mut self, event: EventContext<'_>) -> Result<(), AgentError> {
+        self.state.total_events_processed = self.state.total_events_processed.saturating_add(1);
+
+        let base_score = calculate_base_score(&event, &self.policy);
+        if !base_score.is_finite() || base_score < 0.0 {
+            return Err(invalid_score_error(
+                "operation=calculate_base_score; derived score is not finite",
+                "score",
+            ));
+        }
+
+        self.ensure_source_slot(event.source_ip, event.timestamp_secs)?;
+
+        let source_state = self
+            .state
+            .sources
+            .get_mut(&event.source_ip)
+            .ok_or_else(|| {
+                context_error(
+                    "operation=process_event; source state missing after slot reservation",
+                    "source_ip",
+                )
+            })?;
+
+        source_state.record_observed(
+            event.kind.observed_kind_code(),
+            event.timestamp_secs,
+            self.policy.max_events_per_source,
+            self.policy.correlation_window_secs,
+        )?;
+
+        if self.policy.enable_ancestry_tracking {
+            source_state.update_ancestry_context(&event)?;
+        }
+
+        source_state.last_activity = event.timestamp_secs;
+
+        let mut detected_patterns = HVec::<u16, MAX_PATTERNS_PER_RESULT>::new();
+        detect_patterns(&event, &source_state.history, &mut detected_patterns);
+
+        for pattern in &detected_patterns {
+            push_unique_campaign_pattern(&mut source_state.patterns, *pattern);
+        }
+
+        source_state.kill_chain_stage_code =
+            infer_kill_chain_stage(source_state.patterns.as_slice());
+
+        let boost = ((source_state.history.len().saturating_sub(1)) as f64 * 2.0).min(20.0);
+        let final_score = base_score + boost;
+        if !final_score.is_finite() || final_score < 0.0 {
+            return Err(invalid_score_error(
+                "operation=process_event; final score is not finite",
+                "score",
+            ));
+        }
+
+        let severity_code = severity_from_score(final_score);
+        let on_cooldown = source_state.last_response_secs != 0
+            && event
+                .timestamp_secs
+                .saturating_sub(source_state.last_response_secs)
+                < self.policy.cooldown_secs();
+
+        let resolved_action = determine_action(
+            &self.policy,
+            &event,
+            final_score,
+            severity_code,
+            source_state,
+            on_cooldown,
+        )?;
+
+        if resolved_action.is_destructive() {
+            source_state.destructive_actions_in_window =
+                source_state.destructive_actions_in_window.saturating_add(1);
+        }
+
+        self.state.last_outcome.record(
+            event.source_ip,
+            final_score,
+            severity_code,
+            resolved_action,
+            on_cooldown,
+            source_state.kill_chain_stage_code,
+            &detected_patterns,
+        );
+
+        Ok(())
+    }
+
+    pub(crate) fn record_response_for_source(
+        &mut self,
+        source_ip: IpAddr,
+    ) -> Result<(), AgentError> {
+        let now = now_secs()?;
+        let source_state = self.state.sources.get_mut(&source_ip).ok_or_else(|| {
+            context_error(
+                "operation=record_response_for_source; source_ip is not currently tracked",
+                "source_ip",
+            )
+        })?;
+        source_state.last_response_secs = now;
+        Ok(())
+    }
+
+    pub(crate) fn prune_stale_sources(&mut self, max_age_secs: u64) -> Result<(), AgentError> {
+        if max_age_secs == 0 {
+            return Err(context_error(
+                "operation=prune_stale_sources; max_age_secs must be non-zero",
+                "max_age_secs",
+            ));
+        }
+
+        let now = now_secs()?;
+        let mut stale_sources = heapless::Vec::<IpAddr, MAX_TRACKED_SOURCES>::new();
+
+        for (source_ip, source_state) in &self.state.sources {
+            if now.saturating_sub(source_state.last_activity) >= max_age_secs {
+                stale_sources.push(*source_ip).map_err(|_| {
+                    crate::failures::buffer_error(
+                        "operation=prune_stale_sources; stale-source buffer exhausted",
+                        "sources",
+                    )
+                })?;
+            }
+        }
+
+        for source_ip in stale_sources {
+            let _ = self.state.sources.remove(&source_ip);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn has_last_result(&self) -> bool {
+        self.state.last_outcome.has_result
+    }
+
+    pub(crate) fn last_score(&self) -> f64 {
+        self.state.last_outcome.score
+    }
+
+    pub(crate) fn last_severity_code(&self) -> u8 {
+        self.state.last_outcome.severity_code
+    }
+
+    pub(crate) fn last_action_code(&self) -> u8 {
+        self.state.last_outcome.action.code
+    }
+
+    pub(crate) fn last_on_cooldown(&self) -> bool {
+        self.state.last_outcome.on_cooldown
+    }
+
+    pub(crate) fn last_kill_chain_stage_code(&self) -> u8 {
+        self.state.last_outcome.kill_chain_stage_code
+    }
+
+    pub(crate) fn last_pattern_codes(&self) -> &[u16] {
+        self.state.last_outcome.pattern_codes.as_slice()
+    }
+
+    pub(crate) fn write_last_action_script_path(&self, out: &mut [u8]) -> usize {
+        self.state.last_outcome.action.write_script_path(out)
+    }
+
+    pub(crate) fn write_last_source_ip(&self, out: &mut [u8]) -> usize {
+        let Some(source_ip) = self.state.last_outcome.source_ip else {
+            return 0;
+        };
+
+        let mut ip_text = heapless::String::<MAX_IP_TEXT_LEN>::new();
+        let _ = write!(&mut ip_text, "{source_ip}");
+        copy_str_to_buffer(ip_text.as_str(), out)
+    }
+
+    pub(crate) fn total_events_processed(&self) -> u64 {
+        self.state.total_events_processed
+    }
+
+    pub(crate) fn tracked_sources(&self) -> usize {
+        self.state.sources.len()
+    }
+
+    fn ensure_source_slot(&mut self, source_ip: IpAddr, now: u64) -> Result<(), AgentError> {
+        if self.state.sources.contains_key(&source_ip) {
+            return Ok(());
+        }
+
+        if self.state.sources.len() == MAX_TRACKED_SOURCES {
+            let mut oldest_source = None;
+            let mut oldest_activity = u64::MAX;
+
+            for (candidate_ip, source_state) in &self.state.sources {
+                if source_state.last_activity < oldest_activity {
+                    oldest_activity = source_state.last_activity;
+                    oldest_source = Some(*candidate_ip);
+                }
+            }
+
+            let evicted_source = oldest_source.ok_or_else(|| {
+                context_error(
+                    "operation=ensure_source_slot; source table reported full without candidates",
+                    "sources",
+                )
+            })?;
+            let _ = self.state.sources.remove(&evicted_source);
+        }
+
+        self.state
+            .sources
+            .insert(source_ip, SourceState::new(now))
+            .map_err(|_| {
+                crate::failures::buffer_error(
+                    "operation=ensure_source_slot; fixed-capacity source table is full",
+                    "sources",
+                )
+            })?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::EventType;
-    use std::net::IpAddr;
-    
-    #[test]
-    fn test_engine_creation() {
-        let policy = PolicyConfig::default();
-        let engine = CorrelationEngine::new(policy);
-        
-        let stats = engine.get_stats();
-        assert_eq!(stats.total_events_processed, 0);
-        assert_eq!(stats.active_campaigns, 0);
+    use crate::events::EventKind;
+    use palisade_config::{ActionType, ResponseCondition, ResponseRule, Severity};
+    use std::collections::{HashMap, HashSet};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn hardened_policy() -> PolicyConfig {
+        let mut policy = PolicyConfig::default();
+        policy.scoring.max_events_in_memory = MAX_HISTORY_DEPTH;
+        policy
     }
-    
+
+    fn artifact_event(source_ip: IpAddr, timestamp_secs: u64) -> EventContext<'static> {
+        EventContext {
+            source_ip,
+            confidence: 90.0,
+            timestamp_secs,
+            current_hour: 12,
+            kind: EventKind::ArtifactAccess {
+                artifact_id: "fake-aws-credentials",
+                artifact_tag: "tag-1",
+            },
+        }
+    }
+
     #[test]
-    fn test_event_correlation() {
-        let policy = PolicyConfig::default();
-        let engine = CorrelationEngine::new(policy);
-        
-        let event = SecurityEvent::new(
-            0,
-            "192.168.1.100".parse::<IpAddr>().unwrap(),
-            "session-1".to_string(),
-            EventType::ArtifactAccess {
-                artifact_id: "fake-aws-creds".to_string(),
-                artifact_tag: "tag-123".to_string(),
+    fn test_rejects_unrepresentable_default_policy() {
+        assert!(CorrelationEngine::from_policy(&PolicyConfig::default()).is_err());
+    }
+
+    #[test]
+    fn test_event_updates_last_outcome() {
+        let mut engine = CorrelationEngine::from_policy(&hardened_policy()).unwrap();
+        let event = artifact_event("10.0.0.1".parse().unwrap(), 10);
+
+        engine.process(event).unwrap();
+
+        assert!(engine.has_last_result());
+        assert!(engine.last_score() > 0.0);
+        assert_eq!(engine.tracked_sources(), 1);
+    }
+
+    #[test]
+    fn test_cooldown_tracking_suppresses_action() {
+        let mut policy = hardened_policy();
+        policy.scoring.alert_threshold = 0.0;
+        policy.scoring.weights.artifact_access = 60.0;
+
+        let mut engine = CorrelationEngine::from_policy(&policy).unwrap();
+        let source_ip: IpAddr = "10.0.0.2".parse().unwrap();
+
+        let first = EventContext::new(
+            source_ip,
+            "session-1",
+            90.0,
+            EventKind::ArtifactAccess {
+                artifact_id: "fake-cred",
+                artifact_tag: "tag-2",
             },
         )
-        .with_confidence(80.0);
-        
-        let result = engine.correlate(event).unwrap();
-        
-        assert!(result.score > 0.0);
-        assert!(result.patterns.contains(&AttackPattern::CredentialAccess));
-        assert!(result.campaign_id.is_some());
+        .unwrap();
+        engine.process(first).unwrap();
+        assert_eq!(engine.last_action_code(), ACTION_ALERT);
+        assert!(!engine.last_on_cooldown());
+
+        engine.record_response_for_source(source_ip).unwrap();
+
+        let second = EventContext::new(
+            source_ip,
+            "session-2",
+            90.0,
+            EventKind::ArtifactAccess {
+                artifact_id: "fake-cred",
+                artifact_tag: "tag-3",
+            },
+        )
+        .unwrap();
+        engine.process(second).unwrap();
+        assert!(engine.last_on_cooldown());
+        assert_eq!(engine.last_action_code(), ACTION_LOG);
     }
-    
+
     #[test]
-    fn test_campaign_tracking() {
-        let policy = PolicyConfig::default();
-        let engine = CorrelationEngine::new(policy);
-        
-        // Simulate 3 events from same IP
-        for i in 0..3 {
-            let event = SecurityEvent::new(
-                0,
-                "192.168.1.100".parse::<IpAddr>().unwrap(),
-                format!("session-{}", i),
-                EventType::AuthenticationFailure {
-                    username: "admin".to_string(),
-                    method: "password".to_string(),
-                },
-            );
-            
-            let _ = engine.correlate(event);
+    fn test_not_parented_by_blocks_destructive_action() {
+        let mut policy = hardened_policy();
+        policy.scoring.alert_threshold = 0.0;
+        policy.scoring.weights.ancestry_suspicious = 70.0;
+        policy.response.rules = vec![
+            ResponseRule {
+                severity: Severity::Low,
+                conditions: vec![],
+                action: ActionType::Log,
+            },
+            ResponseRule {
+                severity: Severity::Medium,
+                conditions: vec![],
+                action: ActionType::Alert,
+            },
+            ResponseRule {
+                severity: Severity::High,
+                conditions: vec![ResponseCondition::NotParentedBy {
+                    process_name: "palisade-agent".to_string(),
+                }],
+                action: ActionType::KillProcess,
+            },
+            ResponseRule {
+                severity: Severity::Critical,
+                conditions: vec![],
+                action: ActionType::IsolateHost,
+            },
+        ];
+
+        let mut engine = CorrelationEngine::from_policy(&policy).unwrap();
+        let source_ip: IpAddr = "10.0.0.3".parse().unwrap();
+
+        let blocked = EventContext {
+            source_ip,
+            confidence: 95.0,
+            timestamp_secs: 100,
+            current_hour: 12,
+            kind: EventKind::SuspiciousAncestry {
+                process_chain: &["palisade-agent", "cmd.exe"],
+            },
+        };
+        engine.process(blocked).unwrap();
+        assert_eq!(engine.last_action_code(), ACTION_LOG);
+
+        let allowed = EventContext {
+            source_ip,
+            confidence: 95.0,
+            timestamp_secs: 101,
+            current_hour: 12,
+            kind: EventKind::SuspiciousAncestry {
+                process_chain: &["systemd", "cmd.exe"],
+            },
+        };
+        engine.process(allowed).unwrap();
+        assert_eq!(engine.last_action_code(), ACTION_KILL_PROCESS);
+    }
+
+    #[test]
+    fn test_custom_conditions_are_rejected() {
+        let mut policy = hardened_policy();
+        policy.response.rules[0].conditions = vec![ResponseCondition::Custom {
+            name: "geo_allowlist".to_string(),
+            params: HashMap::new(),
+        }];
+        policy.registered_custom_conditions = HashSet::from(["geo_allowlist".to_string()]);
+
+        assert!(CorrelationEngine::from_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn test_source_eviction_prefers_oldest_activity() {
+        let mut engine = CorrelationEngine::from_policy(&hardened_policy()).unwrap();
+        let first_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let second_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+
+        for index in 0..MAX_TRACKED_SOURCES {
+            let source_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, (index + 1) as u8));
+            engine
+                .process(artifact_event(source_ip, index as u64 + 1))
+                .unwrap();
         }
-        
-        let campaigns = engine.get_active_campaigns();
-        assert_eq!(campaigns.len(), 1);
-        assert_eq!(campaigns[0].event_count, 3);
+
+        engine.process(artifact_event(first_ip, 10_000)).unwrap();
+
+        let new_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+        engine.process(artifact_event(new_ip, 20_000)).unwrap();
+
+        assert!(engine.state.sources.contains_key(&first_ip));
+        assert!(engine.state.sources.contains_key(&new_ip));
+        assert!(!engine.state.sources.contains_key(&second_ip));
     }
 }

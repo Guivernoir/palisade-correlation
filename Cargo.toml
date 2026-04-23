@@ -1,51 +1,82 @@
 [package]
 name = "palisade-correlation"
-version = "0.1.0"
-edition = "2021"
-authors = ["Palisade Contributors"]
-description = "Attack correlation engine for the Palisade honeypot system"
-license = "MIT OR Apache-2.0"
+version = "2.0.0"
+edition = "2024"
+authors = ["Guilherme F. G. Santos <strukturaenterprise@gmail.com>"]
+description = "Security-conscious correlation engine for Palisade honeypot and deception deployments"
+license = "Apache-2.0"
 repository = "https://github.com/Guivernoir/palisade-correlation"
-keywords = ["security", "honeypot", "intrusion-detection", "correlation", "attack-detection"]
+documentation = "https://docs.rs/palisade-correlation"
+readme = "README.md"
+keywords = ["honeypot", "security", "correlation", "detection", "deception"]
 categories = ["network-programming", "security"]
 
 [dependencies]
-# Published Palisade crates
-palisade_errors = "0.2.2"
-palisade-config = "0.1"
-
-# Core dependencies
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+palisade-errors = { version = "2.0.0", default-features = false }
+palisade-config = { version = "2.0.0", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
-
-# Cryptographic primitives
-sha3 = "0.10"
-zeroize = { version = "1", features = ["derive"] }
-
-# Data structures
-dashmap = "6"
 parking_lot = "0.12"
-
-# Encoding
-hex = "0.4"
-
-# Optional features
-tracing = { version = "0.1", optional = true }
-tracing-subscriber = { version = "0.3", optional = true }
-
-[dev-dependencies]
-tempfile = "3"
-tokio-test = "0.4"
-criterion = "0.5"
+heapless = { version = "0.9.2", features = ["zeroize"] }
+zeroize = "1"
 
 [features]
 default = []
-tracing = ["dep:tracing", "dep:tracing-subscriber"]
-# Enable all features for testing
-full = ["tracing"]
+log = ["palisade-config/log", "palisade-errors/log"]
 
 [lib]
 name = "palisade_correlation"
 path = "src/lib.rs"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.bench]
+inherits = "release"
+
+[profile.test]
+opt-level = 2
+
+[dev-dependencies]
+criterion = { version = "0.8.1", features = ["html_reports"] }
+tempfile = "3.13"
+
+# ============================================================================
+# EXAMPLES
+# ============================================================================
+
+[[example]]
+name = "basic_defaults"
+path = "examples/basic_defaults.rs"
+
+[[example]]
+name = "policy_reload"
+path = "examples/policy_reload.rs"
+
+[[example]]
+name = "runtime_hot_paths"
+path = "examples/runtime_hot_paths.rs"
+
+[[example]]
+name = "timing_profile"
+path = "examples/timing_profile.rs"
+
+[[example]]
+name = "encrypted_logging"
+path = "examples/encrypted_logging.rs"
+required-features = ["log"]
+
+# ============================================================================
+# BENCHMARKS
+# ============================================================================
+
+[[bench]]
+name = "correlation_performance"
+path = "benches/correlation_performance.rs"
+harness = false

@@ -1,368 +1,257 @@
-//! Attack pattern detection and classification.
-//!
-//! This module analyzes sequences of events to identify known attack patterns
-//! and techniques, inspired by the MITRE ATT&CK framework.
+//! Fixed-code pattern detection helpers.
 
-use crate::events::{EventType, SecurityEvent};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use crate::events::{
+    EventContext, EventKind, OBSERVED_AUTHENTICATION_FAILURE, OBSERVED_NETWORK_PROBE,
+    OBSERVED_PATH_TRAVERSAL, OBSERVED_RAPID_ENUMERATION, ObservedSignal,
+};
+use crate::matching::contains_ascii_case_insensitive;
+use heapless::{Deque, Vec as HVec};
 
-/// Known attack patterns
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum AttackPattern {
-    /// T1110 - Brute Force
-    BruteForce,
-    
-    /// T1083 - File and Directory Discovery
-    Discovery,
-    
-    /// T1078 - Valid Accounts (credential access)
-    CredentialAccess,
-    
-    /// T1190 - Exploit Public-Facing Application
-    Exploitation,
-    
-    /// T1210 - Exploitation of Remote Services
-    LateralMovement,
-    
-    /// T1498 - Network Denial of Service
-    DenialOfService,
-    
-    /// T1071 - Application Layer Protocol (C2)
-    CommandAndControl,
-    
-    /// T1003 - OS Credential Dumping
-    CredentialDumping,
-    
-    /// T1059 - Command and Scripting Interpreter
-    Execution,
-    
-    /// T1057 - Process Discovery
-    ProcessDiscovery,
-    
-    /// Custom: Honeypot reconnaissance
-    HoneypotProbing,
-}
+pub(crate) const MAX_PATTERNS_PER_RESULT: usize = 8;
+pub(crate) const MAX_PATTERNS_PER_SOURCE: usize = 16;
 
-impl AttackPattern {
-    /// Get human-readable description
-    pub fn description(&self) -> &'static str {
-        match self {
-            Self::BruteForce => "Brute force authentication attempts",
-            Self::Discovery => "File and directory enumeration",
-            Self::CredentialAccess => "Attempting to access credentials",
-            Self::Exploitation => "Exploiting application vulnerabilities",
-            Self::LateralMovement => "Moving laterally across network",
-            Self::DenialOfService => "Denial of service attack",
-            Self::CommandAndControl => "Command and control communication",
-            Self::CredentialDumping => "Dumping credentials from memory",
-            Self::Execution => "Executing malicious commands",
-            Self::ProcessDiscovery => "Enumerating running processes",
-            Self::HoneypotProbing => "Systematic honeypot reconnaissance",
-        }
+pub(crate) const PATTERN_BRUTE_FORCE: u16 = 1110;
+pub(crate) const PATTERN_DISCOVERY: u16 = 1083;
+pub(crate) const PATTERN_CREDENTIAL_ACCESS: u16 = 1078;
+pub(crate) const PATTERN_EXPLOITATION: u16 = 1190;
+pub(crate) const PATTERN_LATERAL_MOVEMENT: u16 = 1210;
+pub(crate) const PATTERN_DENIAL_OF_SERVICE: u16 = 1498;
+pub(crate) const PATTERN_COMMAND_AND_CONTROL: u16 = 1071;
+pub(crate) const PATTERN_CREDENTIAL_DUMPING: u16 = 1003;
+pub(crate) const PATTERN_EXECUTION: u16 = 1059;
+pub(crate) const PATTERN_PROCESS_DISCOVERY: u16 = 1057;
+pub(crate) const PATTERN_HONEYPOT_PROBING: u16 = 9001;
+
+pub(crate) const KILL_CHAIN_NONE: u8 = 0;
+pub(crate) const KILL_CHAIN_RECONNAISSANCE: u8 = 1;
+pub(crate) const KILL_CHAIN_WEAPONIZATION: u8 = 2;
+pub(crate) const KILL_CHAIN_DELIVERY: u8 = 3;
+pub(crate) const KILL_CHAIN_EXPLOITATION: u8 = 4;
+pub(crate) const KILL_CHAIN_INSTALLATION: u8 = 5;
+pub(crate) const KILL_CHAIN_COMMAND_AND_CONTROL: u8 = 6;
+pub(crate) const KILL_CHAIN_ACTIONS_ON_OBJECTIVES: u8 = 7;
+
+pub(crate) fn detect_patterns<const N: usize>(
+    event: &EventContext<'_>,
+    history: &Deque<ObservedSignal, N>,
+    out: &mut HVec<u16, MAX_PATTERNS_PER_RESULT>,
+) {
+    if is_brute_force(history) {
+        push_unique(out, PATTERN_BRUTE_FORCE);
     }
-    
-    /// Get MITRE ATT&CK technique ID (where applicable)
-    pub fn mitre_id(&self) -> Option<&'static str> {
-        match self {
-            Self::BruteForce => Some("T1110"),
-            Self::Discovery => Some("T1083"),
-            Self::CredentialAccess => Some("T1078"),
-            Self::Exploitation => Some("T1190"),
-            Self::LateralMovement => Some("T1210"),
-            Self::DenialOfService => Some("T1498"),
-            Self::CommandAndControl => Some("T1071"),
-            Self::CredentialDumping => Some("T1003"),
-            Self::Execution => Some("T1059"),
-            Self::ProcessDiscovery => Some("T1057"),
-            Self::HoneypotProbing => None,
-        }
+
+    if is_discovery(history) {
+        push_unique(out, PATTERN_DISCOVERY);
+    }
+
+    if is_credential_access(&event.kind) {
+        push_unique(out, PATTERN_CREDENTIAL_ACCESS);
+    }
+
+    if is_exploitation(&event.kind) {
+        push_unique(out, PATTERN_EXPLOITATION);
+    }
+
+    if is_credential_dumping(&event.kind) {
+        push_unique(out, PATTERN_CREDENTIAL_DUMPING);
+    }
+
+    if is_command_and_control(&event.kind) {
+        push_unique(out, PATTERN_COMMAND_AND_CONTROL);
+    }
+
+    if is_execution(&event.kind) {
+        push_unique(out, PATTERN_EXECUTION);
+    }
+
+    if is_process_discovery(&event.kind) {
+        push_unique(out, PATTERN_PROCESS_DISCOVERY);
+    }
+
+    if is_dos(history) {
+        push_unique(out, PATTERN_DENIAL_OF_SERVICE);
+    }
+
+    if is_honeypot_probing(history) {
+        push_unique(out, PATTERN_HONEYPOT_PROBING);
     }
 }
 
-/// Attack campaign - a sequence of correlated attack patterns
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AttackCampaign {
-    /// Campaign identifier
-    pub id: String,
-    
-    /// Source IP
-    pub source_ip: String,
-    
-    /// Start time (Unix timestamp)
-    pub start_time: u64,
-    
-    /// Last activity time (Unix timestamp)
-    pub last_activity: u64,
-    
-    /// Detected patterns
-    pub patterns: Vec<AttackPattern>,
-    
-    /// Event count
-    pub event_count: usize,
-    
-    /// Aggregate confidence score
-    pub confidence: f64,
-    
-    /// Kill chain stage (if determinable)
-    pub kill_chain_stage: Option<KillChainStage>,
+pub(crate) fn infer_kill_chain_stage(patterns: &[u16]) -> u8 {
+    if contains_pattern(patterns, PATTERN_HONEYPOT_PROBING)
+        || contains_pattern(patterns, PATTERN_DISCOVERY)
+    {
+        KILL_CHAIN_RECONNAISSANCE
+    } else if contains_pattern(patterns, PATTERN_EXPLOITATION) {
+        KILL_CHAIN_EXPLOITATION
+    } else if contains_pattern(patterns, PATTERN_COMMAND_AND_CONTROL) {
+        KILL_CHAIN_COMMAND_AND_CONTROL
+    } else if contains_pattern(patterns, PATTERN_EXECUTION) {
+        KILL_CHAIN_INSTALLATION
+    } else if contains_pattern(patterns, PATTERN_CREDENTIAL_DUMPING) {
+        KILL_CHAIN_ACTIONS_ON_OBJECTIVES
+    } else if contains_pattern(patterns, PATTERN_BRUTE_FORCE) {
+        KILL_CHAIN_DELIVERY
+    } else {
+        KILL_CHAIN_NONE
+    }
 }
 
-/// Cyber kill chain stages
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum KillChainStage {
-    /// Reconnaissance
-    Reconnaissance,
-    
-    /// Weaponization
-    Weaponization,
-    
-    /// Delivery
-    Delivery,
-    
-    /// Exploitation
-    Exploitation,
-    
-    /// Installation
-    Installation,
-    
-    /// Command & Control
-    CommandAndControl,
-    
-    /// Actions on Objectives
-    ActionsOnObjectives,
+pub(crate) fn contains_pattern(patterns: &[u16], target: u16) -> bool {
+    patterns.contains(&target)
 }
 
-/// Pattern detector analyzes event sequences
-pub struct PatternDetector {
-    /// Event history by source IP (bounded size)
-    history: HashMap<String, Vec<EventType>>,
-    
-    /// Maximum events to track per IP
-    max_events_per_ip: usize,
+pub(crate) fn push_unique(out: &mut HVec<u16, MAX_PATTERNS_PER_RESULT>, code: u16) {
+    if !out.contains(&code) {
+        let _ = out.push(code);
+    }
 }
 
-impl PatternDetector {
-    /// Create a new pattern detector
-    pub fn new(max_events_per_ip: usize) -> Self {
-        Self {
-            history: HashMap::new(),
-            max_events_per_ip,
+pub(crate) fn push_unique_campaign_pattern(
+    out: &mut HVec<u16, MAX_PATTERNS_PER_SOURCE>,
+    code: u16,
+) {
+    if !out.contains(&code) {
+        let _ = out.push(code);
+    }
+}
+
+fn is_brute_force<const N: usize>(history: &Deque<ObservedSignal, N>) -> bool {
+    history
+        .iter()
+        .filter(|entry| entry.observed_kind == OBSERVED_AUTHENTICATION_FAILURE)
+        .count()
+        >= 5
+}
+
+fn is_discovery<const N: usize>(history: &Deque<ObservedSignal, N>) -> bool {
+    let has_scan = history.iter().any(|entry| {
+        entry.observed_kind == OBSERVED_RAPID_ENUMERATION
+            || entry.observed_kind == OBSERVED_NETWORK_PROBE
+    });
+
+    let traversal_count = history
+        .iter()
+        .filter(|entry| entry.observed_kind == OBSERVED_PATH_TRAVERSAL)
+        .count();
+
+    has_scan || traversal_count >= 3
+}
+
+fn is_credential_access(event: &EventKind<'_>) -> bool {
+    match event {
+        EventKind::ArtifactAccess { artifact_id, .. } => {
+            contains_ascii_case_insensitive(artifact_id, "cred")
+                || contains_ascii_case_insensitive(artifact_id, "key")
+                || contains_ascii_case_insensitive(artifact_id, "token")
+        }
+        _ => false,
+    }
+}
+
+fn is_exploitation(event: &EventKind<'_>) -> bool {
+    matches!(
+        event,
+        EventKind::SqlInjection { .. }
+            | EventKind::CommandInjection { .. }
+            | EventKind::PathTraversal { .. }
+    )
+}
+
+fn is_credential_dumping(event: &EventKind<'_>) -> bool {
+    match event {
+        EventKind::SuspiciousProcess { process_name, .. } => {
+            contains_ascii_case_insensitive(process_name, "mimikatz")
+                || contains_ascii_case_insensitive(process_name, "procdump")
+                || contains_ascii_case_insensitive(process_name, "lazagne")
+                || contains_ascii_case_insensitive(process_name, "secretsdump")
+        }
+        _ => false,
+    }
+}
+
+fn is_command_and_control(event: &EventKind<'_>) -> bool {
+    matches!(event, EventKind::C2Communication { .. })
+}
+
+fn is_execution(event: &EventKind<'_>) -> bool {
+    matches!(
+        event,
+        EventKind::CommandInjection { .. } | EventKind::MalwareDownload { .. }
+    )
+}
+
+fn is_process_discovery(event: &EventKind<'_>) -> bool {
+    matches!(
+        event,
+        EventKind::SuspiciousProcess { .. } | EventKind::SuspiciousAncestry { .. }
+    )
+}
+
+fn is_dos<const N: usize>(history: &Deque<ObservedSignal, N>) -> bool {
+    if history.len() < 10 {
+        return false;
+    }
+
+    let scan_count = history
+        .iter()
+        .filter(|entry| {
+            entry.observed_kind == OBSERVED_RAPID_ENUMERATION
+                || entry.observed_kind == OBSERVED_NETWORK_PROBE
+        })
+        .count();
+
+    (scan_count as f64 / history.len() as f64) > 0.8
+}
+
+fn is_honeypot_probing<const N: usize>(history: &Deque<ObservedSignal, N>) -> bool {
+    if history.len() < 8 {
+        return false;
+    }
+
+    let mut unique = HVec::<u8, 16>::new();
+    for entry in history {
+        if !unique.contains(&entry.observed_kind) {
+            let _ = unique.push(entry.observed_kind);
         }
     }
-    
-    /// Analyze an event and detect patterns
-    pub fn analyze(&mut self, event: &SecurityEvent) -> Vec<AttackPattern> {
-        let source = event.source_ip.to_string();
-        
-        // Update history (bounded)
-        let history = self.history.entry(source.clone()).or_insert_with(Vec::new);
-        history.push(event.event_type.clone());
-        
-        if history.len() > self.max_events_per_ip {
-            history.remove(0);
-        }
-        
-        // Clone history to avoid borrow checker issues
-        let history_snapshot = history.clone();
-        
-        // Detect patterns using the snapshot
-        let mut patterns = Vec::new();
-        
-        // Check for brute force
-        if Self::is_brute_force_static(&history_snapshot) {
-            patterns.push(AttackPattern::BruteForce);
-        }
-        
-        // Check for discovery
-        if Self::is_discovery_static(&history_snapshot) {
-            patterns.push(AttackPattern::Discovery);
-        }
-        
-        // Check for credential access
-        if Self::is_credential_access_static(&event.event_type) {
-            patterns.push(AttackPattern::CredentialAccess);
-        }
-        
-        // Check for exploitation attempts
-        if Self::is_exploitation_static(&event.event_type) {
-            patterns.push(AttackPattern::Exploitation);
-        }
-        
-        // Check for credential dumping
-        if Self::is_credential_dumping_static(&event.event_type) {
-            patterns.push(AttackPattern::CredentialDumping);
-        }
-        
-        // Check for DoS
-        if Self::is_dos_static(&history_snapshot) {
-            patterns.push(AttackPattern::DenialOfService);
-        }
-        
-        // Check for honeypot probing
-        if Self::is_honeypot_probing_static(&history_snapshot) {
-            patterns.push(AttackPattern::HoneypotProbing);
-        }
-        
-        patterns
-    }
-    
-    /// Detect brute force pattern
-    fn is_brute_force_static(history: &[EventType]) -> bool {
-        // 5+ auth failures in recent history
-        history.iter()
-            .filter(|e| matches!(e, EventType::AuthenticationFailure { .. }))
-            .count() >= 5
-    }
-    
-    /// Detect discovery pattern
-    fn is_discovery_static(history: &[EventType]) -> bool {
-        // Rapid enumeration or multiple path traversals
-        let rapid_enum = history.iter()
-            .any(|e| matches!(e, EventType::RapidEnumeration { .. }));
-        
-        let path_traversals = history.iter()
-            .filter(|e| matches!(e, EventType::PathTraversal { .. }))
-            .count();
-        
-        rapid_enum || path_traversals >= 3
-    }
-    
-    /// Detect credential access
-    fn is_credential_access_static(event_type: &EventType) -> bool {
-        matches!(event_type, EventType::ArtifactAccess { artifact_id, .. }
-            if artifact_id.contains("cred") || artifact_id.contains("key") || artifact_id.contains("token"))
-    }
-    
-    /// Detect exploitation attempts
-    fn is_exploitation_static(event_type: &EventType) -> bool {
-        matches!(event_type, 
-            EventType::SqlInjection { .. } |
-            EventType::CommandInjection { .. } |
-            EventType::PathTraversal { .. }
-        )
-    }
-    
-    /// Detect credential dumping
-    fn is_credential_dumping_static(event_type: &EventType) -> bool {
-        if let EventType::SuspiciousProcess { process_name, .. } = event_type {
-            let name_lower = process_name.to_lowercase();
-            name_lower.contains("mimikatz") ||
-                name_lower.contains("procdump") ||
-                name_lower.contains("lazagne") ||
-                name_lower.contains("secretsdump")
-        } else {
-            false
-        }
-    }
-    
-    /// Detect DoS pattern
-    fn is_dos_static(history: &[EventType]) -> bool {
-        // Check if history is filled with rapid enumeration or errors
-        if history.len() < 10 {
-            return false;
-        }
-        
-        // More than 80% of recent events are rapid enumeration
-        let rapid_count = history.iter()
-            .filter(|e| matches!(e, EventType::RapidEnumeration { .. }))
-            .count();
-        
-        (rapid_count as f64 / history.len() as f64) > 0.8
-    }
-    
-    /// Detect honeypot probing (systematic testing)
-    fn is_honeypot_probing_static(history: &[EventType]) -> bool {
-        // Diverse event types suggest systematic probing
-        let unique_types = history.iter()
-            .map(|e| std::mem::discriminant(e))
-            .collect::<std::collections::HashSet<_>>();
-        
-        unique_types.len() >= 4 && history.len() >= 8
-    }
-    
-    /// Infer kill chain stage from patterns
-    pub fn infer_kill_chain_stage(patterns: &[AttackPattern]) -> Option<KillChainStage> {
-        if patterns.contains(&AttackPattern::HoneypotProbing) 
-            || patterns.contains(&AttackPattern::Discovery) {
-            Some(KillChainStage::Reconnaissance)
-        } else if patterns.contains(&AttackPattern::Exploitation) {
-            Some(KillChainStage::Exploitation)
-        } else if patterns.contains(&AttackPattern::CredentialDumping) {
-            Some(KillChainStage::ActionsOnObjectives)
-        } else if patterns.contains(&AttackPattern::BruteForce) {
-            Some(KillChainStage::Delivery)
-        } else {
-            None
-        }
-    }
-    
-    /// Clear history for a specific IP
-    pub fn clear_history(&mut self, source_ip: &str) {
-        self.history.remove(source_ip);
-    }
-    
-    /// Get total tracked IPs
-    pub fn tracked_ip_count(&self) -> usize {
-        self.history.len()
-    }
+
+    unique.len() >= 4
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::IpAddr;
-    
-    fn create_test_event(event_type: EventType) -> SecurityEvent {
-        SecurityEvent::new(
-            1,
-            "192.168.1.100".parse::<IpAddr>().unwrap(),
-            "test-session".to_string(),
-            event_type,
-        )
-    }
-    
+    use crate::events::{EventContext, EventKind};
+
     #[test]
-    fn test_brute_force_detection() {
-        let mut detector = PatternDetector::new(100);
-        
-        // Simulate 5 auth failures
+    fn test_brute_force_pattern() {
+        let mut history = Deque::<ObservedSignal, 16>::new();
         for _ in 0..5 {
-            let event = create_test_event(EventType::AuthenticationFailure {
-                username: "admin".to_string(),
-                method: "password".to_string(),
-            });
-            
-            let patterns = detector.analyze(&event);
-            
-            // Should detect brute force on or after 5th attempt
-            if detector.history.get(&event.source_ip.to_string()).unwrap().len() >= 5 {
-                assert!(patterns.contains(&AttackPattern::BruteForce));
-            }
+            history
+                .push_back(ObservedSignal::new(OBSERVED_AUTHENTICATION_FAILURE, 1))
+                .unwrap();
         }
+
+        let event = EventContext::new(
+            "127.0.0.1".parse().unwrap(),
+            "session-1",
+            70.0,
+            EventKind::AuthenticationFailure {
+                username: "admin",
+                method: "password",
+            },
+        )
+        .unwrap();
+
+        let mut detected = HVec::<u16, MAX_PATTERNS_PER_RESULT>::new();
+        detect_patterns(&event, &history, &mut detected);
+        assert!(detected.contains(&PATTERN_BRUTE_FORCE));
     }
-    
-    #[test]
-    fn test_credential_access_detection() {
-        let mut detector = PatternDetector::new(100);
-        
-        let event = create_test_event(EventType::ArtifactAccess {
-            artifact_id: "fake-aws-credentials".to_string(),
-            artifact_tag: "tag-123".to_string(),
-        });
-        
-        let patterns = detector.analyze(&event);
-        assert!(patterns.contains(&AttackPattern::CredentialAccess));
-    }
-    
+
     #[test]
     fn test_kill_chain_inference() {
-        let patterns = vec![
-            AttackPattern::Discovery,
-            AttackPattern::HoneypotProbing,
-        ];
-        
-        let stage = PatternDetector::infer_kill_chain_stage(&patterns);
-        assert_eq!(stage, Some(KillChainStage::Reconnaissance));
+        let patterns = [PATTERN_DISCOVERY, PATTERN_HONEYPOT_PROBING];
+        assert_eq!(infer_kill_chain_stage(&patterns), KILL_CHAIN_RECONNAISSANCE);
     }
 }
